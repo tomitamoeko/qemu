@@ -2483,7 +2483,7 @@ uint8_t pci_rom_calculate_checksum(uint8_t *ptr, uint32_t size)
     }
     ptr[6] = orig_checksum;
 
-    return -checksum;
+    return checksum;
 }
 
 /* Patch the PCI vendor and device ids in a PCI rom image if necessary.
@@ -2496,54 +2496,87 @@ void pci_rom_patch_ids(PCIDevice *pdev, uint8_t *ptr, uint32_t size)
     uint16_t rom_device_id;
     uint16_t rom_magic;
     uint16_t pcir_offset;
+    uint32_t rom_offset;
+    uint32_t rom_size;
     uint8_t checksum;
-
-    /* Words in rom data are little endian (like in PCI configuration),
-       so they can be read / written with pci_get_word / pci_set_word. */
-
-    /* Only a valid rom will be patched. */
-    rom_magic = pci_get_word(ptr);
-    if (rom_magic != 0xaa55) {
-        trace_pci_bad_rom_magic(rom_magic, 0xaa55);
-        return;
-    }
-    pcir_offset = pci_get_word(ptr + 0x18);
-    if (pcir_offset + 8 >= size || memcmp(ptr + pcir_offset, "PCIR", 4)) {
-        trace_pci_bad_pcir_offset(pcir_offset);
-        return;
-    }
+    uint8_t code_type;
+    bool last_image;
+    uint8_t *rom;
+    uint8_t *pcir;
 
     vendor_id = pci_get_word(pdev->config + PCI_VENDOR_ID);
     device_id = pci_get_word(pdev->config + PCI_DEVICE_ID);
-    rom_vendor_id = pci_get_word(ptr + pcir_offset + 4);
-    rom_device_id = pci_get_word(ptr + pcir_offset + 6);
 
-    trace_pci_rom_and_pci_ids(pdev->romfile, vendor_id, device_id,
-                              rom_vendor_id, rom_device_id);
+    /*
+     * A PCI option rom may bundle several images (e.g. a legacy x86 BIOS
+     * image followed by a UEFI image). Each image starts with a ROM header
+     * and references a PCI Data Structure ("PCIR"). Walk every image and
+     * patch the ids of the ones that need it.
+     *
+     * Words in rom data are little endian (like in PCI configuration), so
+     * they can be read / written with pci_get_word / pci_set_word.
+     */
+    for (rom_offset = 0; rom_offset < size; rom_offset += rom_size) {
+        rom = ptr + rom_offset;
 
-    /* In case the checksum is bogus */
-    checksum = pci_rom_calculate_checksum(ptr, size);
-    if (ptr[6] != checksum) {
-        trace_pci_rom_checksum_change(ptr[6], checksum);
-        ptr[6] = checksum;
-    }
+        /* Only a valid rom will be patched. */
+        rom_magic = pci_get_word(rom);
+        if (rom_magic != 0xaa55) {
+            trace_pci_bad_rom_magic(rom_magic, 0xaa55);
+            break;
+        }
 
-    if (vendor_id != rom_vendor_id) {
-        /* Patch vendor id and checksum (at offset 6 for etherboot roms). */
-        checksum += (uint8_t)rom_vendor_id + (uint8_t)(rom_vendor_id >> 8);
-        checksum -= (uint8_t)vendor_id + (uint8_t)(vendor_id >> 8);
-        trace_pci_rom_checksum_change(ptr[6], checksum);
-        ptr[6] = checksum;
-        pci_set_word(ptr + pcir_offset + 4, vendor_id);
-    }
+        pcir_offset = pci_get_word(rom + 0x18);
+        pcir = rom + pcir_offset;
+        if (rom_offset + pcir_offset + 0x18 >= size ||
+            memcmp(pcir, "PCIR", 4)) {
+            trace_pci_bad_pcir_offset(pcir_offset);
+            break;
+        }
 
-    if (device_id != rom_device_id) {
-        /* Patch device id and checksum (at offset 6 for etherboot roms). */
-        checksum += (uint8_t)rom_device_id + (uint8_t)(rom_device_id >> 8);
-        checksum -= (uint8_t)device_id + (uint8_t)(device_id >> 8);
-        trace_pci_rom_checksum_change(ptr[6], checksum);
-        ptr[6] = checksum;
-        pci_set_word(ptr + pcir_offset + 6, device_id);
+        rom_size = pci_get_word(pcir + 0x10) * 512;
+        if (rom_size == 0 || rom_offset + rom_size > size) {
+            break;
+        }
+
+        code_type = pci_get_byte(pcir + 0x14);
+        last_image = pci_get_byte(pcir + 0x15) & 0x80;
+
+        /* OVMF won't check IDs in PCIR header, skip EFI roms (code type 3) */
+        if (code_type != 0x03) {
+            rom_vendor_id = pci_get_word(pcir + 4);
+            rom_device_id = pci_get_word(pcir + 6);
+
+            trace_pci_rom_and_pci_ids(pdev->romfile, vendor_id, device_id,
+                                      rom_vendor_id, rom_device_id);
+
+            /* In case the checksum is bogus */
+            checksum = pci_rom_calculate_checksum(rom, rom_size);
+
+            if (vendor_id != rom_vendor_id) {
+                /* Patch vendor id and checksum */
+                checksum += (uint8_t)vendor_id + (uint8_t)(vendor_id >> 8);
+                checksum -= (uint8_t)rom_vendor_id + (uint8_t)(rom_vendor_id >> 8);
+                pci_set_word(pcir + 4, vendor_id);
+            }
+
+            if (device_id != rom_device_id) {
+                /* Patch device id and checksum */
+                checksum += (uint8_t)device_id + (uint8_t)(device_id >> 8);
+                checksum -= (uint8_t)rom_device_id + (uint8_t)(rom_device_id >> 8);
+                pci_set_word(pcir + 6, device_id);
+            }
+
+            /* Checksum is at offset 6 for etherboot roms */
+            if (rom[6] != (uint8_t)-checksum) {
+                trace_pci_rom_checksum_change(rom[6], (uint8_t)-checksum);
+                rom[6] = -checksum;
+            }
+        }
+
+        if (last_image) {
+            break;
+        }
     }
 }
 

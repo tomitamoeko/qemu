@@ -841,7 +841,7 @@ void vfio_probe_igd_legacy_rom_quirk(VFIOPCIDevice *vdev)
     memset(vdev->rom + bdsm_offset, 0, sizeof(uint32_t));
 
     checksum = pci_rom_calculate_checksum(vdev->rom, vdev->rom_size);
-    ((uint8_t *)vdev->rom)[6] = checksum;
+    ((uint8_t *)vdev->rom)[6] = -checksum;
 
     trace_vfio_pci_igd_vbios_patched(vdev->vbasedev.name);
 }
